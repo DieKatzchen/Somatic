@@ -1,3 +1,7 @@
+#include <BleConnectionStatus.h>
+#include <BleCombo.h>
+#include "BluetoothSerial.h"
+
 /*************
    Somatic data glove firmware
    by Zack Freedman of Voidstar Lab
@@ -9,22 +13,35 @@
    Deploy to Teensy 4.0 at max clock speed
 */
 
+#define training_mode
+//#define hid_mode
+
 #include <math.h>
 #include <Wire.h>
-#include <TensorFlowLite.h>
-#include  "tensorflow/lite/experimental/micro/kernels/all_ops_resolver.h"
+#include <elapsedMillis.h>
+#include <analogWrite.h>
+#include <TensorFlowLite_ESP32.h>
+#include "tensorflow/lite/experimental/micro/kernels/all_ops_resolver.h"
 #include "tensorflow/lite/experimental/micro/micro_error_reporter.h"
 #include "tensorflow/lite/experimental/micro/micro_interpreter.h"
 #include "tensorflow/lite/experimental/micro/testing/micro_test.h"
 #include "tensorflow/lite/schema/schema_generated.h"
 #include "tensorflow/lite/version.h"
-#include "model.h"
+#ifdef hid_mode
+  #include "model.h"
+#endif
+
+BleComboKeyboard bleKeyboard("Somatic","Voidstar Labs");
+BleComboMouse bleMouse(&bleKeyboard);
+BluetoothSerial btSerial;
 
 // The following dumb bullshit just lets us turn off serial debug
 #define DEBUG
 #define GET_MACRO(_1, _2, NAME, ...) NAME
 
 byte me;
+
+
 
 #ifdef DEBUG
 #define debug_print_formatted(x, y) Serial.print(x,y)
@@ -48,8 +65,6 @@ byte me;
 // Keep this declaration here so I can use the debug macros in it
 #include "imu.h"
 
-#define training_mode
-//#define hid_mode
 
 //#define dont_actually_write
 // #define debug_angular_velocity
@@ -57,9 +72,10 @@ byte me;
 #define debug_dump_bt_rx
 //#define debug_tensorflow
 
-#define bt Serial1
-#define btResponseMaxLength 20
-char btResponseBuffer[btResponseMaxLength];
+//TODO set bt to be serial debug
+//#define bt Serial1
+//#define btResponseMaxLength 20
+//char btResponseBuffer[btResponseMaxLength];
 
 // Globals, needed by TFLite
 namespace {
@@ -78,7 +94,6 @@ uint8_t tensor_arena[kTensorArenaSize];
 
 unsigned long fingerDebounce = 100;
 
-const byte btRtsPin = 2;
 const byte vibePin = 23;
 const byte fingerSwitchPins[] = {9, 10, 11, 12};
 
@@ -134,25 +149,23 @@ elapsedMillis timeSinceFreeze;
 #define freezeTime 2000
 
 void setup() {
-  Serial.begin(115200);
-  bt.begin(115200);
+  Serial.begin(115200);  
 
   delay(5000);
   #ifdef training_mode
+  btSerial.begin("Somatic Training");
   debug_println("Training mode");
   #endif
 
   #ifdef hid_mode
+  bleMouse.begin();
+  bleKeyboard.begin();
   debug_println("HID mode");
   #endif
-  for (int i = 0; i < 3; i++) {
-    delay(200);
-    if (setUpBluetooth()) break;
-  }
 
   analogWriteFrequency(vibePin, 93750);  // Set to high frequency so switching noise is inaudible
  
-  pinMode(btRtsPin, INPUT);
+  //pinMode(btRtsPin, INPUT);
 
   // Some butt-head didn't leave room for i2c pullups on the lil board.
   // Using adjacent pins as makeshift 3V3 sources :|
@@ -171,10 +184,11 @@ void setup() {
     pinMode(fingerSwitchPins[i], INPUT_PULLUP);
   }
 
+  #ifdef hid_mode
   // The following wad-o-code is cribbed straight from the TFLite hello_world project
   static tflite::MicroErrorReporter micro_error_reporter;
   error_reporter = &micro_error_reporter;
-
+ 
   // Map the model into a usable data structure. This doesn't involve any
   // copying or parsing, it's a very lightweight operation.
   model = tflite::GetModel(modelBin);
@@ -229,6 +243,7 @@ void setup() {
 
   debug_print("Gesture cone angle: ");
   debug_println(gestureConeAngle, 5);
+  #endif
 
   lastTimestamp = micros();
 }
@@ -243,15 +258,15 @@ void loop() {
     analogWrite(vibePin, 0);
   }
 
-  while (Serial.available()) {
+  /*while (Serial.available()) {
     int incoming = Serial.read();
     //    Serial.write(incoming);
-    bt.write(incoming);
+    btSerial.write(incoming);
 
     timeSinceLastDebugCommandChar = 0;
-  }
+  }*/
 
-  while (bt.available()) {
+  /*while (btSerial.available()) {
     if (bt.peek() == '>') {
       if (bt.available() >= 5
           && bt.read() == '>'
@@ -268,10 +283,10 @@ void loop() {
 #ifdef debug_dump_bt_rx
       if (timeSinceLastDebugCommandChar < commandLockout)
         timeSinceLastDebugCommandChar = 0;
-      Serial.write(bt.read());
+      Serial.write(btSerial.read());
 #endif
     }
-  }
+  }*/
 
   // TODO: Handle %CONNECT,5800E382649E,0 and %DISCONNECT messages from bt
 
@@ -449,6 +464,7 @@ void loop() {
       unsigned long tfBenchmark = micros();
 #endif
 
+#ifdef hid_mode
       // Machine learning hijinks follows
       for (int i = 0; i < 100; i++) {
         input->data.f[i] = processedGesture[i / 2][i % 2];
@@ -503,6 +519,7 @@ void loop() {
       }
 
       gestureBufferLength = 0;
+ #endif
     }  // gestureBufferLength > 0
 
     if (timeSinceBuzzStarted >= 80
@@ -514,7 +531,7 @@ void loop() {
     }
 
     if (timeSinceLastDebugCommandChar >= commandLockout) {
-      if (!digitalRead(btRtsPin)) {
+      //if (!digitalRead(btRtsPin)) {
 #ifdef training_mode
         //   Packet format:
         //   >[./|],[./|],[./|],[./|],[float h],[float p],[float r],[float accel x],[accel y],[accel z],[us since last sample]
@@ -558,7 +575,7 @@ void loop() {
         itoa(sampleRate, &outgoingPacket[strlen(outgoingPacket)], 10);
         outgoingPacket[strlen(outgoingPacket)] = '\n';
 
-        bt.write(outgoingPacket, strlen(outgoingPacket));
+        btSerial.println(outgoingPacket);
 #endif  // ifdef training_mode
 
 #ifdef hid_mode
@@ -577,20 +594,18 @@ void loop() {
               debug_print(yStop);
               debug_println(" units up");
 
-              // Raw mouse report format. See RN42 HID User Guide, or really the BT spec itself
-              byte buf[] = {0xfd, 0x05, 0x02, 0x00, char(xStop), char(yStop), 0x00};
-              bt.write(buf, 7);
+              bleMouse.move(xStop,yStop);
             }
           }
         }
         else {
-          bt.print(winningGlyph);
+          bleKeyboard.write(winningGlyph);
           debug_print("Typing ");
           debug_println(char(winningGlyph));
         }
 #endif  // ifdef hid_mode
 
-        if (isFrozen) {
+        /*if (isFrozen) {
           debug_println("Back to normal");
           isFrozen = false;
         }
@@ -608,7 +623,7 @@ void loop() {
             timeSinceFreeze = 0;
           }
         }
-      }
+      }*/
     }
 
     lastTimestamp = timestamp;
@@ -624,6 +639,7 @@ void quaternionMultiply(float* q1, float* q2, float* out) {
   out[3] = -q1[0] * q2[0] - q1[1] * q2[1] - q1[2] * q2[2] + q1[3] * q2[3];
 }
 
+/*
 bool setUpBluetooth() {
   // Note that this will ALWAYS FAIL when the module is connected in PAIR mode and the CPU alone is reset.
   // I did that for convenience, to use the module's built-in autoconnect.
